@@ -235,7 +235,8 @@ jobs:
           # Split into batches of up to BATCH_SIZE genomes;
           # the final batch naturally contains any remainder.
           split --lines="${BATCH_SIZE}" --numeric-suffixes=1 --suffix-length=4 \
-            "${GENOMES_TMP}" "${BATCHES_DIR}/batch_"
+            "${GENOMES_TMP}" "${BATCHES_DIR}/batch_" \
+            || { echo "ERROR: Failed to split genomes into batches"; exit 1; }
 
           # Per-genome download with retry (called inside parallel subshells)
           download_one() {
@@ -253,18 +254,21 @@ jobs:
                 sleep $(( attempt * 5 ))
               fi
             done
+            return 0
           }
           export -f download_one
           export DOWNLOAD_RETRIES
 
           BATCH_NUM=0
+          SKETCH_FAILURES=0
           for batch_file in "${BATCHES_DIR}"/batch_*; do
             BATCH_NUM=$(( BATCH_NUM + 1 ))
             BATCH_COUNT=$(wc -l < "${batch_file}")
             echo "=== Batch ${BATCH_NUM}: ${BATCH_COUNT} genome(s) ==="
 
             # Download all genomes in this batch in parallel
-            parallel --jobs "${WORKERS}" download_one :::: "${batch_file}"
+            parallel --jobs "${WORKERS}" download_one :::: "${batch_file}" \
+              || echo "WARNING: Some downloads failed in batch ${BATCH_NUM}"
 
             # Collect successfully downloaded assemblies
             GENOME_PATHS=()
@@ -283,11 +287,17 @@ jobs:
             if ! "$MASH_BIN" sketch -k 21 -s 1000 -o "${BATCH_SKETCH}" \
                    "${GENOME_PATHS[@]}" 2>&1; then
               echo "ERROR: mash sketch failed for batch ${BATCH_NUM}"
+              SKETCH_FAILURES=$(( SKETCH_FAILURES + 1 ))
             fi
 
             # Delete downloaded assemblies to free disk
             rm -f "${GENOME_PATHS[@]}"
           done
+
+          if [ "${SKETCH_FAILURES}" -gt 0 ]; then
+            echo "ERROR: ${SKETCH_FAILURES} batch(es) failed to sketch"
+            exit 1
+          fi
 
           PRODUCED=$(ls sketches/*.msh 2>/dev/null | wc -l)
           echo "=== Chunk ${CHUNK}: ${PRODUCED} batch sketch(es) produced ==="
