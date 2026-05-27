@@ -10,3 +10,5 @@ version = "0.1.0"
 [dependencies]
 awscli = ">=2.34.53,<3"
 mash = ">=2.3,<3"
+parallel = ">=20220101"     # GNU parallel — intra-chunk parallel sketching
+pp-sketchlib = ">=2.1.0,<3" # sketchlib CLI — faster alternative sketch engine
