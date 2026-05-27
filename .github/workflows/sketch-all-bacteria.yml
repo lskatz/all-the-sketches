@@ -6,14 +6,14 @@ name: Sketch All-the-Bacteria
 #
 # Design:
 #   Chunking
-#     TARGET_CHUNK_SIZE (default 1000) drives chunk size.
-#     If TARGET_CHUNK_SIZE would produce > MAX_JOBS chunks it is scaled up
-#     to stay within the Actions matrix limit (hard limit: 256).
+#     Genomes are divided evenly across MAX_JOBS (200) matrix jobs.
+#     Chunk size = ceil(total / MAX_JOBS).  A custom TARGET_CHUNK_SIZE > 0
+#     overrides this (capped so chunks never exceed the 256-job Actions limit).
 #
-#   Batch download → sketch
-#     Within each chunk job, genomes are processed in batches of up to 1000.
+#   Batch download → sketch (within each chunk job)
+#     Genomes in a chunk are processed in batches of up to BATCH_SIZE (1000).
 #     All genomes in a batch are downloaded in parallel (WORKERS_CAP threads),
-#     then sketched in a single mash sketch call, then deleted.
+#     then passed to a single mash sketch call, then deleted.
 #     The final batch handles any remainder genomes automatically.
 #
 #   S3 retry
@@ -32,17 +32,18 @@ on:
         type: string
       target_chunk_size:
         description: >
-          Target genomes per chunk job (0 = derive from MAX_JOBS only).
-          Default 1000: each chunk job downloads and sketches up to 1000 genomes.
+          Target genomes per chunk job (0 = derive from MAX_JOBS, spreading
+          genomes evenly across 200 jobs). Override only if you need a fixed
+          chunk size.
         required: false
-        default: '1000'
+        default: '0'
         type: string
 
 # ── defaults used when triggered by push (no workflow_dispatch inputs) ───────
 env:
   DEFAULT_MAX_GENOMES: '1000'        # change to '0' for a full production run
   MAX_JOBS: '200'                    # hard cap on matrix entries (Actions limit: 256)
-  DEFAULT_TARGET_CHUNK_SIZE: '1000'  # genomes per chunk job
+  DEFAULT_TARGET_CHUNK_SIZE: '0'     # 0 = spread evenly across MAX_JOBS (200) jobs
   DOWNLOAD_RETRIES: '3'              # S3 retry attempts per genome
   WORKERS_CAP: '4'                   # max parallel download workers per runner
 
