@@ -7,19 +7,14 @@ name: Sketch All-the-Bacteria
 # Optimization levers (over the original sequential single-engine design):
 #
 #   Intra-chunk parallelism
-#     Mash:      WORKERS genomes processed concurrently per runner (GNU parallel).
-#     sketchlib: entire chunk downloaded then batch-sketched with all CPUs.
+#     WORKERS genomes processed concurrently per runner (GNU parallel).
 #     WORKERS = min(nproc, WORKERS_CAP); default cap = 4 to bound disk usage.
+#     Each worker owns its full download → mash sketch → delete cycle.
 #
 #   S3 retry
 #     Each download is retried up to DOWNLOAD_RETRIES times (default 3) with
-#     exponential backoff before the genome is skipped.  One slow object no
+#     linear backoff before the genome is skipped.  One slow object no
 #     longer stalls the whole chunk.
-#
-#   Engine choice
-#     mash      (default) — standard .msh output; familiar toolchain.
-#     sketchlib           — pp-sketchlib; batch/threaded; .h5 output.
-#     Select via the `engine` workflow input.
 #
 #   Timeout-safe chunking
 #     TARGET_CHUNK_SIZE (default 50) is the primary chunk-size driver.
@@ -42,17 +37,6 @@ on:
         required: false
         default: '1000'
         type: string
-      engine:
-        description: >
-          Sketching engine.
-          mash: produces .msh files (default, standard).
-          sketchlib: produces .h5 files (faster batch/threaded alternative).
-        required: false
-        default: 'mash'
-        type: choice
-        options:
-          - mash
-          - sketchlib
       target_chunk_size:
         description: >
           Target genomes per chunk job (0 = derive from MAX_JOBS only).
@@ -66,7 +50,6 @@ env:
   DEFAULT_MAX_GENOMES: '1000'        # change to '0' for a full production run
   MAX_JOBS: '200'                    # hard cap on matrix entries (Actions limit: 256)
   DEFAULT_TARGET_CHUNK_SIZE: '50'    # timeout-safe chunk size (see header notes)
-  DEFAULT_ENGINE: 'mash'
   DOWNLOAD_RETRIES: '3'              # S3 retry attempts per genome
   WORKERS_CAP: '4'                   # max parallel sketch workers per runner
 
@@ -74,7 +57,7 @@ env:
 # JOB 1 – prepare
 #   • Download the AllTheBacteria assembly manifest from S3
 #   • Subset (for testing) and split into timeout-safe chunk files
-#   • Emit a JSON array of chunk IDs and the resolved engine name
+#   • Emit a JSON array of chunk IDs
 # ---------------------------------------------------------------------------
 jobs:
   prepare:
@@ -82,7 +65,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       chunks: ${{ steps.make-chunks.outputs.chunks }}
-      engine: ${{ steps.params.outputs.engine }}
 
     steps:
       - name: Checkout repository
@@ -98,10 +80,8 @@ jobs:
         id: params
         run: |
           MAX="${{ github.event.inputs.max_genomes }}"
-          ENGINE="${{ github.event.inputs.engine }}"
           TARGET="${{ github.event.inputs.target_chunk_size }}"
           echo "max_genomes=${MAX:-$DEFAULT_MAX_GENOMES}" >> "$GITHUB_OUTPUT"
-          echo "engine=${ENGINE:-$DEFAULT_ENGINE}" >> "$GITHUB_OUTPUT"
           echo "target_chunk_size=${TARGET:-$DEFAULT_TARGET_CHUNK_SIZE}" >> "$GITHUB_OUTPUT"
 
       - name: Download assembly manifest from S3
@@ -205,14 +185,9 @@ jobs:
 
 # ---------------------------------------------------------------------------
 # JOB 2 – sketch  (fan-out matrix over every chunk)
-#   Mash path:
-#     • WORKERS genomes processed in parallel (GNU parallel)
-#     • Each worker: download (with retry) → mash sketch → delete assembly
-#     • Paste per-genome sketches into one chunk .msh file
-#   sketchlib path:
-#     • Serial download of all genomes in chunk (with retry)
-#     • Single threaded sketchlib call using all available CPUs
-#     • Delete all assemblies after sketching
+#   • WORKERS genomes processed in parallel (GNU parallel)
+#   • Each worker: download (with retry) → mash sketch → delete assembly
+#   • Paste per-genome sketches into one chunk .msh file
 # ---------------------------------------------------------------------------
   sketch:
     name: Sketch chunk ${{ matrix.chunk }}
@@ -224,7 +199,6 @@ jobs:
       fail-fast: false   # let other chunks continue even if one fails
     env:
       CHUNK: ${{ matrix.chunk }}
-      ENGINE: ${{ needs.prepare.outputs.engine }}
 
     steps:
       - name: Checkout repository
@@ -244,15 +218,14 @@ jobs:
       - name: Disk space (before)
         run: df -h
 
-      # ── Mash path: parallel download → sketch → delete ──────────────────
-      - name: Download, sketch, and delete assemblies (Mash)
-        if: env.ENGINE == 'mash'
+      # ── Parallel download → sketch → delete ─────────────────────────────
+      - name: Download, sketch, and delete assemblies
         run: |
           set -euo pipefail
           T0=$SECONDS
 
           CHUNK_FILE="chunks/chunk_${CHUNK}.txt"
-          echo "=== Chunk: ${CHUNK} | engine: mash ==="
+          echo "=== Chunk: ${CHUNK} ==="
           cat "$CHUNK_FILE"
           echo ""
 
@@ -326,81 +299,11 @@ jobs:
           echo "TIMING sketch_step=$((SECONDS - T0))s"
           ls -lh sketches/
 
-      # ── sketchlib path: download all → batch sketch with all CPUs ────────
-      - name: Download all assemblies (sketchlib)
-        if: env.ENGINE == 'sketchlib'
-        run: |
-          set -euo pipefail
-          T0=$SECONDS
-
-          CHUNK_FILE="chunks/chunk_${CHUNK}.txt"
-          echo "=== Chunk: ${CHUNK} | engine: sketchlib (download phase) ==="
-
-          mkdir -p assemblies sketches
-          # rfile format expected by sketchlib sketch -l: name<TAB>path
-          > sketches/rfile.txt
-
-          while IFS= read -r genome; do
-            [[ -z "$genome" ]] && continue
-            accession="${genome%.fa.gz}"
-            s3_uri="s3://allthebacteria-assemblies/${genome}"
-            downloaded=false
-
-            for attempt in $(seq 1 "${DOWNLOAD_RETRIES}"); do
-              if pixi run aws s3 cp --no-sign-request \
-                     "$s3_uri" "assemblies/${genome}"; then
-                downloaded=true
-                break
-              fi
-              if [ "$attempt" -ge "${DOWNLOAD_RETRIES}" ]; then
-                echo "SKIP ${genome}: download failed after ${DOWNLOAD_RETRIES} attempts"
-              else
-                echo "Retry ${attempt}/${DOWNLOAD_RETRIES} for ${genome}"
-                sleep $((attempt * 5))
-              fi
-            done
-
-            if [ "$downloaded" = true ]; then
-              printf '%s\t%s\n' "${accession}" "assemblies/${genome}" \
-                >> sketches/rfile.txt
-            fi
-          done < "${CHUNK_FILE}"
-
-          DOWNLOADED=$(wc -l < sketches/rfile.txt)
-          EXPECTED=$(grep -c '[^[:space:]]' "${CHUNK_FILE}" || echo 0)
-          echo "Downloaded: ${DOWNLOADED}/${EXPECTED}"
-          echo "TIMING download_phase=$((SECONDS - T0))s"
-
-      - name: Batch sketch assemblies (sketchlib)
-        if: env.ENGINE == 'sketchlib'
-        run: |
-          set -euo pipefail
-          T0=$SECONDS
-
-          CPUS=$(nproc 2>/dev/null || echo 2)
-          echo "=== sketchlib sketch | CPUs: ${CPUS} ==="
-
-          # -l flag tells sketchlib the positional argument is a tab-separated
-          # rfile (name<TAB>path) rather than a list of FASTA paths directly.
-          pixi run sketchlib sketch \
-            -k 21 -s 1000 \
-            --cpus "${CPUS}" \
-            -l \
-            "sketches/chunk_${CHUNK}" \
-            sketches/rfile.txt
-
-          echo "TIMING sketchlib_sketch=$((SECONDS - T0))s"
-          ls -lh sketches/chunk_${CHUNK}.*
-
-          # Delete assemblies now that sketching is complete
-          rm -f assemblies/*.fa.gz
-
       - name: Disk space (after sketching)
         run: df -h
 
-      # ── Mash: paste per-genome sketches into one chunk sketch ────────────
-      - name: Paste per-genome sketches into chunk sketch (Mash)
-        if: env.ENGINE == 'mash'
+      # ── Paste per-genome sketches into one chunk sketch ──────────────────
+      - name: Paste per-genome sketches into chunk sketch
         run: |
           set -euo pipefail
           T0=$SECONDS
@@ -417,45 +320,17 @@ jobs:
           pixi run mash info "chunk_${CHUNK}.msh"
           echo "TIMING mash_paste=$((SECONDS - T0))s"
 
-      # ── sketchlib: move chunk DB to upload path ──────────────────────────
-      - name: Prepare chunk sketch for upload (sketchlib)
-        if: env.ENGINE == 'sketchlib'
-        run: |
-          set -euo pipefail
-          for ext in h5 refs; do
-            src="sketches/chunk_${CHUNK}.${ext}"
-            dst="chunk_${CHUNK}.${ext}"
-            if [ -f "$src" ]; then
-              cp "$src" "$dst"
-            else
-              echo "WARNING: expected sketch file ${src} not found"
-            fi
-          done
-          ls -lh "chunk_${CHUNK}".* || { echo "ERROR: no chunk sketch files found"; exit 1; }
-
-      - name: Upload chunk sketch (Mash)
-        if: env.ENGINE == 'mash'
+      - name: Upload chunk sketch
         uses: actions/upload-artifact@v7
         with:
           name: sketch-chunk-${{ matrix.chunk }}
           path: chunk_${{ matrix.chunk }}.msh
           retention-days: 7
 
-      - name: Upload chunk sketch (sketchlib)
-        if: env.ENGINE == 'sketchlib'
-        uses: actions/upload-artifact@v7
-        with:
-          name: sketch-chunk-${{ matrix.chunk }}
-          path: |
-            chunk_${{ matrix.chunk }}.h5
-            chunk_${{ matrix.chunk }}.refs
-          retention-days: 7
-
 # ---------------------------------------------------------------------------
 # JOB 3 – combine
 #   • Download every chunk sketch artifact
-#   • Mash:      mash paste → all-the-sketches.msh
-#   • sketchlib: sketchlib merge → all-the-sketches.h5/.refs
+#   • mash paste → all-the-sketches.msh
 #   • Upload the final sketch and optionally publish to a GitHub Release
 # ---------------------------------------------------------------------------
   combine:
@@ -464,8 +339,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required to create releases and upload assets
-    env:
-      ENGINE: ${{ needs.prepare.outputs.engine }}
 
     steps:
       - name: Checkout repository
@@ -492,8 +365,7 @@ jobs:
       - name: Disk space (before paste)
         run: df -h
 
-      - name: Combine into final sketch (Mash)
-        if: env.ENGINE == 'mash'
+      - name: Combine into final sketch
         run: |
           set -euo pipefail
           T0=$SECONDS
@@ -503,52 +375,14 @@ jobs:
           pixi run mash info all-the-sketches.msh
           echo "TIMING final_mash_paste=$((SECONDS - T0))s"
 
-      - name: Combine into final sketch (sketchlib)
-        if: env.ENGINE == 'sketchlib'
-        run: |
-          set -euo pipefail
-          T0=$SECONDS
-
-          # Build list of DB prefixes (strip .h5 suffix) for sketchlib merge
-          DB_PREFIXES=$(ls chunk-sketches/*.h5 | sed 's|\.h5$||' | tr '\n' ' ')
-          echo "Merging: ${DB_PREFIXES}"
-
-          pixi run sketchlib merge all-the-sketches ${DB_PREFIXES} \
-          || {
-            EXIT_CODE=$?
-            if ! command -v sketchlib &>/dev/null; then
-              echo "ERROR: 'sketchlib' command not found in PATH."
-            else
-              echo "ERROR: 'sketchlib merge' failed (exit code ${EXIT_CODE})."
-              echo "       This may indicate an incompatible sketchlib version or corrupt input databases."
-            fi
-            echo "       Chunk databases remain in chunk-sketches/ for manual merging."
-            ls -lh chunk-sketches/*.h5
-            # Record a manifest of chunk DBs as the combined deliverable
-            ls chunk-sketches/*.h5 > all-the-sketches.manifest
-          }
-          echo "TIMING sketchlib_merge=$((SECONDS - T0))s"
-
       - name: Disk space (after paste)
         run: df -h
 
-      - name: Upload final combined sketch (Mash)
-        if: env.ENGINE == 'mash'
+      - name: Upload final combined sketch
         uses: actions/upload-artifact@v7
         with:
           name: all-the-sketches
           path: all-the-sketches.msh
-          retention-days: 90
-
-      - name: Upload final combined sketch (sketchlib)
-        if: env.ENGINE == 'sketchlib'
-        uses: actions/upload-artifact@v7
-        with:
-          name: all-the-sketches
-          path: |
-            all-the-sketches.h5
-            all-the-sketches.refs
-            all-the-sketches.manifest
           retention-days: 90
 
       - name: Publish to GitHub Release
@@ -556,17 +390,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Collect whichever sketch files were produced by the chosen engine
-          ASSETS=""
-          for f in all-the-sketches.msh all-the-sketches.h5 \
-                    all-the-sketches.refs all-the-sketches.manifest; do
-            [ -f "$f" ] && ASSETS="${ASSETS} ${f}"
-          done
-          ASSETS=$(echo "${ASSETS}" | xargs)
-
           gh release create "${{ github.ref_name }}" \
             --title "all-the-sketches ${{ github.ref_name }}" \
-            --notes "Combined sketch of AllTheBacteria assemblies (tag \`${{ github.ref_name }}\`, engine: ${ENGINE})." \
-            ${ASSETS} \
+            --notes "Combined Mash sketch of AllTheBacteria assemblies (tag \`${{ github.ref_name }}\`)." \
+            all-the-sketches.msh \
           || gh release upload "${{ github.ref_name }}" \
-               ${ASSETS} --clobber
+               all-the-sketches.msh --clobber
