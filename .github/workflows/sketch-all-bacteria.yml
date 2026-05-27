@@ -1,7 +1,7 @@
 name: Sketch All-the-Bacteria
 
 # ---------------------------------------------------------------------------
-# Testing mode (active): 1 000 genomes, ≤ 200 parallel jobs
+# Testing mode (active): 200 400 genomes (1 002/job × 200 jobs), ≤ 200 parallel jobs
 # Production mode:       all genomes,   ≤ 200 parallel jobs
 #
 # Design:
@@ -26,9 +26,9 @@ on:
   workflow_dispatch:
     inputs:
       max_genomes:
-        description: 'Max genomes to process (0 = all). Use 1000 for testing.'
+        description: 'Max genomes to process (0 = all). Use 200400 for remainder testing.'
         required: false
-        default: '1000'
+        default: '200400'
         type: string
       target_chunk_size:
         description: >
@@ -41,7 +41,7 @@ on:
 
 # ── defaults used when triggered by push (no workflow_dispatch inputs) ───────
 env:
-  DEFAULT_MAX_GENOMES: '1000'        # change to '0' for a full production run
+  DEFAULT_MAX_GENOMES: '200400'      # 1002/job × 200 jobs; change to '0' for a full production run
   MAX_JOBS: '200'                    # hard cap on matrix entries (Actions limit: 256)
   DEFAULT_TARGET_CHUNK_SIZE: '0'     # 0 = spread evenly across MAX_JOBS (200) jobs
   DOWNLOAD_RETRIES: '3'              # S3 retry attempts per genome
