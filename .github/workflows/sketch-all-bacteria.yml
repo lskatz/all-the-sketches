@@ -4,28 +4,21 @@ name: Sketch All-the-Bacteria
 # Testing mode (active): 1 000 genomes, ≤ 200 parallel jobs
 # Production mode:       all genomes,   ≤ 200 parallel jobs
 #
-# Optimization levers (over the original sequential single-engine design):
-#
-#   Intra-chunk parallelism
-#     WORKERS genomes processed concurrently per runner (GNU parallel).
-#     WORKERS = min(nproc, WORKERS_CAP); default cap = 4 to bound disk usage.
-#     Each worker owns its full download → mash sketch → delete cycle.
-#
-#   S3 retry
-#     Each download is retried up to DOWNLOAD_RETRIES times (default 3) with
-#     linear backoff before the genome is skipped.  One slow object no
-#     longer stalls the whole chunk.
-#
-#   Timeout-safe chunking
-#     TARGET_CHUNK_SIZE (default 50) is the primary chunk-size driver.
-#     With WORKERS=4 and ~30 s/genome this is ~6 min/chunk — well within
-#     the 6-hour GitHub Actions limit.
+# Design:
+#   Chunking
+#     TARGET_CHUNK_SIZE (default 1000) drives chunk size.
 #     If TARGET_CHUNK_SIZE would produce > MAX_JOBS chunks it is scaled up
 #     to stay within the Actions matrix limit (hard limit: 256).
 #
-#   Per-step timing
-#     Every major step emits "TIMING key=Xs" lines so CI logs can be used
-#     directly for bottleneck analysis without external monitoring.
+#   Batch download → sketch
+#     Within each chunk job, genomes are processed in batches of up to 1000.
+#     All genomes in a batch are downloaded in parallel (WORKERS_CAP threads),
+#     then sketched in a single mash sketch call, then deleted.
+#     The final batch handles any remainder genomes automatically.
+#
+#   S3 retry
+#     Each download is retried up to DOWNLOAD_RETRIES times (default 3) with
+#     linear backoff before the genome is skipped.
 # ---------------------------------------------------------------------------
 
 on:
@@ -40,18 +33,18 @@ on:
       target_chunk_size:
         description: >
           Target genomes per chunk job (0 = derive from MAX_JOBS only).
-          Default 50: ~6 min/chunk at 4 parallel workers × 30 s/genome.
+          Default 1000: each chunk job downloads and sketches up to 1000 genomes.
         required: false
-        default: '50'
+        default: '1000'
         type: string
 
 # ── defaults used when triggered by push (no workflow_dispatch inputs) ───────
 env:
   DEFAULT_MAX_GENOMES: '1000'        # change to '0' for a full production run
   MAX_JOBS: '200'                    # hard cap on matrix entries (Actions limit: 256)
-  DEFAULT_TARGET_CHUNK_SIZE: '50'    # timeout-safe chunk size (see header notes)
+  DEFAULT_TARGET_CHUNK_SIZE: '1000'  # genomes per chunk job
   DOWNLOAD_RETRIES: '3'              # S3 retry attempts per genome
-  WORKERS_CAP: '4'                   # max parallel sketch workers per runner
+  WORKERS_CAP: '4'                   # max parallel download workers per runner
 
 # ---------------------------------------------------------------------------
 # JOB 1 – prepare
@@ -87,7 +80,6 @@ jobs:
       - name: Download assembly manifest from S3
         run: |
           set -euo pipefail
-          T0=$SECONDS
           mkdir -p data
 
           echo "=== Finding latest manifest file ==="
@@ -110,13 +102,11 @@ jobs:
 
           TOTAL=$(wc -l < data/all_assemblies.txt)
           echo "Total assemblies in manifest: $TOTAL"
-          echo "TIMING manifest_download=$((SECONDS - T0))s"
 
       - name: Subset and split into chunks
         id: make-chunks
         run: |
           set -euo pipefail
-          T0=$SECONDS
 
           MAX_GENOMES="${{ steps.params.outputs.max_genomes }}"
           TARGET_CHUNK_SIZE="${{ steps.params.outputs.target_chunk_size }}"
@@ -174,7 +164,6 @@ jobs:
             | jq -sc .)
           echo "chunks=${CHUNKS}" >> "$GITHUB_OUTPUT"
           echo "Matrix: ${CHUNKS}"
-          echo "TIMING make_chunks=$((SECONDS - T0))s"
 
       - name: Upload chunk manifests
         uses: actions/upload-artifact@v7
@@ -215,110 +204,110 @@ jobs:
           name: chunk-manifests
           path: chunks/
 
-      - name: Disk space (before)
-        run: df -h
-
-      # ── Parallel download → sketch → delete ─────────────────────────────
+      # ── Batch download → sketch → delete (up to 1000 genomes per batch) ──
       - name: Download, sketch, and delete assemblies
         run: |
           set -euo pipefail
-          T0=$SECONDS
 
           CHUNK_FILE="chunks/chunk_${CHUNK}.txt"
-          echo "=== Chunk: ${CHUNK} ==="
-          cat "$CHUNK_FILE"
-          echo ""
+          BATCH_SIZE=1000
 
-          # Worker count: available CPUs, capped at WORKERS_CAP
+          # Worker count for parallel downloads: available CPUs, capped at WORKERS_CAP
           AVAIL=$(nproc 2>/dev/null || echo 2)
           WORKERS=$(( AVAIL < WORKERS_CAP ? AVAIL : WORKERS_CAP ))
-          echo "Workers: ${WORKERS} (nproc=${AVAIL}, cap=${WORKERS_CAP})"
-
-          mkdir -p assemblies sketches
 
           # Resolve the absolute path to mash once so that parallel subshells
-          # can use it directly.  GNU parallel's bash workers do not reliably
-          # inherit the pixi-activated PATH (the pixi env bin dir may not be
-          # visible inside BASH_ENV-sourced scripts), so calling mash by bare
-          # name fails.  Capturing the path here — where pixi is active — and
-          # exporting it sidesteps that limitation without wrapping every call
-          # in `pixi run` (which would add per-genome pixi overhead).
+          # (used for downloads) can use it.
           MASH_BIN=$(pixi run which mash)
           export MASH_BIN
 
-          # Per-genome worker — runs inside GNU parallel subshells.
-          sketch_one() {
-            local genome="$1"
-            local accession="${genome%.fa.gz}"
-            local s3_uri="s3://allthebacteria-assemblies/${genome}"
-            local T0=$SECONDS   # $SECONDS resets to 0 in each parallel subshell
-            local attempt downloaded=false
+          mkdir -p assemblies sketches
 
+          # Strip blank lines
+          GENOMES_TMP=$(mktemp)
+          BATCHES_DIR=$(mktemp -d)
+          trap 'rm -rf "${BATCHES_DIR}" "${GENOMES_TMP}"' EXIT
+          grep -v '^[[:space:]]*$' "${CHUNK_FILE}" > "${GENOMES_TMP}"
+
+          TOTAL=$(wc -l < "${GENOMES_TMP}")
+          echo "Chunk ${CHUNK}: ${TOTAL} genomes"
+
+          # Split into batches of up to BATCH_SIZE genomes;
+          # the final batch naturally contains any remainder.
+          split --lines="${BATCH_SIZE}" --numeric-suffixes=1 --suffix-length=4 \
+            "${GENOMES_TMP}" "${BATCHES_DIR}/batch_"
+
+          # Per-genome download with retry (called inside parallel subshells)
+          download_one() {
+            local genome="$1"
+            local s3_uri="s3://allthebacteria-assemblies/${genome}"
+            local attempt
             for attempt in $(seq 1 "${DOWNLOAD_RETRIES}"); do
-              if aws s3 cp --no-sign-request \
-                     "$s3_uri" "assemblies/${genome}" 2>&1; then
-                downloaded=true
-                break
+              if aws s3 cp --no-sign-request "$s3_uri" "assemblies/${genome}" 2>&1; then
+                return 0
               fi
               if [ "$attempt" -ge "${DOWNLOAD_RETRIES}" ]; then
                 echo "SKIP ${genome}: download failed after ${DOWNLOAD_RETRIES} attempts"
               else
                 echo "Retry ${attempt}/${DOWNLOAD_RETRIES} for ${genome}"
-                sleep $((attempt * 5))
+                sleep $(( attempt * 5 ))
               fi
             done
-
-            [ "$downloaded" = true ] || return 0
-
-            if ! "$MASH_BIN" sketch -k 21 -s 1000 \
-                   -o "sketches/${accession}" "assemblies/${genome}" 2>&1; then
-              echo "SKIP ${genome}: sketch failed"
-              rm -f "assemblies/${genome}"
-              return 0
-            fi
-
-            rm -f "assemblies/${genome}"
-            echo "OK ${accession} elapsed=$(( SECONDS - T0 ))s"
           }
-          export -f sketch_one
+          export -f download_one
           export DOWNLOAD_RETRIES
 
-          # Strip blank lines into a temp file; trap ensures cleanup on failure
-          GENOMES_TMP=$(mktemp)
-          trap 'rm -f "${GENOMES_TMP}"' EXIT
-          grep -v '^[[:space:]]*$' "${CHUNK_FILE}" > "${GENOMES_TMP}"
+          BATCH_NUM=0
+          for batch_file in "${BATCHES_DIR}"/batch_*; do
+            BATCH_NUM=$(( BATCH_NUM + 1 ))
+            BATCH_COUNT=$(wc -l < "${batch_file}")
+            echo "=== Batch ${BATCH_NUM}: ${BATCH_COUNT} genome(s) ==="
 
-          # Run each genome through sketch_one in parallel
-          parallel --jobs "${WORKERS}" --line-buffer sketch_one \
-            :::: "${GENOMES_TMP}"
+            # Download all genomes in this batch in parallel
+            parallel --jobs "${WORKERS}" download_one :::: "${batch_file}"
+
+            # Collect successfully downloaded assemblies
+            GENOME_PATHS=()
+            while IFS= read -r genome; do
+              [ -f "assemblies/${genome}" ] && GENOME_PATHS+=("assemblies/${genome}")
+            done < "${batch_file}"
+
+            if [ "${#GENOME_PATHS[@]}" -eq 0 ]; then
+              echo "No assemblies downloaded for batch ${BATCH_NUM}, skipping"
+              continue
+            fi
+
+            # Sketch all assemblies in this batch with a single mash call
+            BATCH_SKETCH="sketches/batch_$(printf '%04d' "${BATCH_NUM}")"
+            echo "Sketching ${#GENOME_PATHS[@]} assemblies → ${BATCH_SKETCH}.msh"
+            if ! "$MASH_BIN" sketch -k 21 -s 1000 -o "${BATCH_SKETCH}" \
+                   "${GENOME_PATHS[@]}" 2>&1; then
+              echo "ERROR: mash sketch failed for batch ${BATCH_NUM}"
+            fi
+
+            # Delete downloaded assemblies to free disk
+            rm -f "${GENOME_PATHS[@]}"
+          done
 
           PRODUCED=$(ls sketches/*.msh 2>/dev/null | wc -l)
-          EXPECTED=$(grep -c '[^[:space:]]' "${CHUNK_FILE}" || echo 0)
-          echo ""
-          echo "=== Chunk ${CHUNK}: ${PRODUCED}/${EXPECTED} sketches produced ==="
-          echo "TIMING sketch_step=$((SECONDS - T0))s"
+          echo "=== Chunk ${CHUNK}: ${PRODUCED} batch sketch(es) produced ==="
           ls -lh sketches/
 
-      - name: Disk space (after sketching)
-        run: df -h
-
-      # ── Paste per-genome sketches into one chunk sketch ──────────────────
-      - name: Paste per-genome sketches into chunk sketch
+      # ── Paste batch sketches into one chunk sketch ───────────────────────
+      - name: Paste batch sketches into chunk sketch
         run: |
           set -euo pipefail
-          T0=$SECONDS
 
           SKETCH_COUNT=$(ls sketches/*.msh 2>/dev/null | wc -l)
           if [ "$SKETCH_COUNT" -eq 0 ]; then
             echo "ERROR: no sketches produced for chunk ${CHUNK}"
             exit 1
           fi
-          echo "Pasting ${SKETCH_COUNT} sketches for chunk ${CHUNK}"
+          echo "Pasting ${SKETCH_COUNT} batch sketch(es) for chunk ${CHUNK}"
 
           pixi run mash paste "chunk_${CHUNK}.msh" sketches/*.msh
           echo "=== Chunk sketch info ==="
           pixi run mash info "chunk_${CHUNK}.msh"
-          echo "TIMING mash_paste=$((SECONDS - T0))s"
 
       - name: Upload chunk sketch
         uses: actions/upload-artifact@v7
@@ -362,21 +351,13 @@ jobs:
           ls -lh chunk-sketches/
           echo "Total files: $(ls chunk-sketches/ | wc -l)"
 
-      - name: Disk space (before paste)
-        run: df -h
-
       - name: Combine into final sketch
         run: |
           set -euo pipefail
-          T0=$SECONDS
 
           pixi run mash paste all-the-sketches.msh chunk-sketches/*.msh
           echo "=== Final sketch info ==="
           pixi run mash info all-the-sketches.msh
-          echo "TIMING final_mash_paste=$((SECONDS - T0))s"
-
-      - name: Disk space (after paste)
-        run: df -h
 
       - name: Upload final combined sketch
         uses: actions/upload-artifact@v7
