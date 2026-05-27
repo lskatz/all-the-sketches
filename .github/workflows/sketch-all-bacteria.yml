@@ -270,8 +270,7 @@ jobs:
             local genome="$1"
             local accession="${genome%.fa.gz}"
             local s3_uri="s3://allthebacteria-assemblies/${genome}"
-            local t0
-            t0=$(date +%s)
+            local T0=$SECONDS   # $SECONDS resets to 0 in each parallel subshell
             local attempt downloaded=false
 
             for attempt in $(seq 1 "${DOWNLOAD_RETRIES}"); do
@@ -298,16 +297,19 @@ jobs:
             fi
 
             rm -f "assemblies/${genome}"
-            echo "OK ${accession} elapsed=$(( $(date +%s) - t0 ))s"
+            echo "OK ${accession} elapsed=$(( SECONDS - T0 ))s"
           }
           export -f sketch_one
           export DOWNLOAD_RETRIES
 
-          # Strip blank lines, then run each genome through sketch_one in parallel
-          grep -v '^[[:space:]]*$' "${CHUNK_FILE}" > /tmp/genomes_$$.txt
+          # Strip blank lines into a temp file; trap ensures cleanup on failure
+          GENOMES_TMP=$(mktemp)
+          trap 'rm -f "${GENOMES_TMP}"' EXIT
+          grep -v '^[[:space:]]*$' "${CHUNK_FILE}" > "${GENOMES_TMP}"
+
+          # Run each genome through sketch_one in parallel
           parallel --jobs "${WORKERS}" --line-buffer sketch_one \
-            :::: /tmp/genomes_$$.txt
-          rm -f /tmp/genomes_$$.txt
+            :::: "${GENOMES_TMP}"
 
           PRODUCED=$(ls sketches/*.msh 2>/dev/null | wc -l)
           EXPECTED=$(grep -c '[^[:space:]]' "${CHUNK_FILE}" || echo 0)
@@ -412,9 +414,16 @@ jobs:
         if: env.ENGINE == 'sketchlib'
         run: |
           set -euo pipefail
-          cp "sketches/chunk_${CHUNK}.h5"   "chunk_${CHUNK}.h5"   2>/dev/null || true
-          cp "sketches/chunk_${CHUNK}.refs" "chunk_${CHUNK}.refs" 2>/dev/null || true
-          ls -lh "chunk_${CHUNK}".*
+          for ext in h5 refs; do
+            src="sketches/chunk_${CHUNK}.${ext}"
+            dst="chunk_${CHUNK}.${ext}"
+            if [ -f "$src" ]; then
+              cp "$src" "$dst"
+            else
+              echo "WARNING: expected sketch file ${src} not found"
+            fi
+          done
+          ls -lh "chunk_${CHUNK}".* || { echo "ERROR: no chunk sketch files found"; exit 1; }
 
       - name: Upload chunk sketch (Mash)
         if: env.ENGINE == 'mash'
@@ -498,8 +507,14 @@ jobs:
 
           pixi run sketchlib merge all-the-sketches ${DB_PREFIXES} \
           || {
-            echo "WARNING: 'sketchlib merge' failed or is not available."
-            echo "         Chunk databases remain in chunk-sketches/ for manual merging."
+            EXIT_CODE=$?
+            if ! command -v sketchlib &>/dev/null; then
+              echo "ERROR: 'sketchlib' command not found in PATH."
+            else
+              echo "ERROR: 'sketchlib merge' failed (exit code ${EXIT_CODE})."
+              echo "       This may indicate an incompatible sketchlib version or corrupt input databases."
+            fi
+            echo "       Chunk databases remain in chunk-sketches/ for manual merging."
             ls -lh chunk-sketches/*.h5
             # Record a manifest of chunk DBs as the combined deliverable
             ls chunk-sketches/*.h5 > all-the-sketches.manifest
@@ -539,7 +554,7 @@ jobs:
                     all-the-sketches.refs all-the-sketches.manifest; do
             [ -f "$f" ] && ASSETS="${ASSETS} ${f}"
           done
-          ASSETS="${ASSETS# }"
+          ASSETS=$(echo "${ASSETS}" | xargs)
 
           gh release create "${{ github.ref_name }}" \
             --title "all-the-sketches ${{ github.ref_name }}" \
