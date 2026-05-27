@@ -245,13 +245,14 @@ jobs:
             local s3_uri="s3://allthebacteria-assemblies/${genome}"
             local attempt
             for attempt in $(seq 1 "${DOWNLOAD_RETRIES}"); do
-              if aws s3 cp --no-sign-request "$s3_uri" "assemblies/${genome}" 2>&1; then
+              if aws s3 cp --no-sign-request --no-progress \
+                   "$s3_uri" "assemblies/${genome}" >/dev/null; then
                 return 0
               fi
               if [ "$attempt" -ge "${DOWNLOAD_RETRIES}" ]; then
-                echo "SKIP ${genome}: download failed after ${DOWNLOAD_RETRIES} attempts"
+                echo "SKIP ${genome}: download failed after ${DOWNLOAD_RETRIES} attempts" >&2
               else
-                echo "Retry ${attempt}/${DOWNLOAD_RETRIES} for ${genome}"
+                echo "Retry ${attempt}/${DOWNLOAD_RETRIES} for ${genome}" >&2
                 sleep $(( attempt * 5 ))
               fi
             done
@@ -261,11 +262,12 @@ jobs:
           export DOWNLOAD_RETRIES
 
           BATCH_NUM=0
+          DOWNLOADED_TOTAL=0
           SKETCH_FAILURES=0
           for batch_file in "${BATCHES_DIR}"/batch_*; do
             BATCH_NUM=$(( BATCH_NUM + 1 ))
             BATCH_COUNT=$(wc -l < "${batch_file}")
-            echo "=== Batch ${BATCH_NUM}: ${BATCH_COUNT} genome(s) ==="
+            echo "=== Batch ${BATCH_NUM}: downloading ${BATCH_COUNT} genome(s) ==="
 
             # Download all genomes in this batch in parallel
             parallel --jobs "${WORKERS}" download_one :::: "${batch_file}" \
@@ -276,6 +278,12 @@ jobs:
             while IFS= read -r genome; do
               [ -f "assemblies/${genome}" ] && GENOME_PATHS+=("assemblies/${genome}")
             done < "${batch_file}"
+
+            BATCH_DOWNLOADED=${#GENOME_PATHS[@]}
+            DOWNLOADED_TOTAL=$(( DOWNLOADED_TOTAL + BATCH_DOWNLOADED ))
+            REMAINING=$(( TOTAL - DOWNLOADED_TOTAL ))
+            echo "Downloaded ${BATCH_DOWNLOADED} of ${BATCH_COUNT} in batch ${BATCH_NUM}" \
+                 "(${DOWNLOADED_TOTAL}/${TOTAL} total, ${REMAINING} remaining)"
 
             if [ "${#GENOME_PATHS[@]}" -eq 0 ]; then
               echo "No assemblies downloaded for batch ${BATCH_NUM}, skipping"
