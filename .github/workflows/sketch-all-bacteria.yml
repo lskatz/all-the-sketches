@@ -263,9 +263,17 @@ jobs:
 
           mkdir -p assemblies sketches
 
+          # Resolve the absolute path to mash once so that parallel subshells
+          # can use it directly.  GNU parallel's bash workers do not reliably
+          # inherit the pixi-activated PATH (the pixi env bin dir may not be
+          # visible inside BASH_ENV-sourced scripts), so calling mash by bare
+          # name fails.  Capturing the path here — where pixi is active — and
+          # exporting it sidesteps that limitation without wrapping every call
+          # in `pixi run` (which would add per-genome pixi overhead).
+          MASH_BIN=$(pixi run which mash)
+          export MASH_BIN
+
           # Per-genome worker — runs inside GNU parallel subshells.
-          # setup-pixi has already added mash and aws to PATH, so we call
-          # them directly (no `pixi run` wrapper) for lower overhead.
           sketch_one() {
             local genome="$1"
             local accession="${genome%.fa.gz}"
@@ -289,7 +297,7 @@ jobs:
 
             [ "$downloaded" = true ] || return 0
 
-            if ! mash sketch -k 21 -s 1000 \
+            if ! "$MASH_BIN" sketch -k 21 -s 1000 \
                    -o "sketches/${accession}" "assemblies/${genome}" 2>&1; then
               echo "SKIP ${genome}: sketch failed"
               rm -f "assemblies/${genome}"
