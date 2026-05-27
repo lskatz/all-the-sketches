@@ -8,6 +8,7 @@ name: Sketch All-the-Bacteria
 # ---------------------------------------------------------------------------
 
 on:
+  push:
   workflow_dispatch:
     inputs:
       max_genomes:
@@ -49,7 +50,6 @@ jobs:
         uses: prefix-dev/setup-pixi@v0.9.6
         with:
           pixi-version: latest
-          cache: true
 
       # Resolve effective settings (prefer workflow_dispatch input > default)
       - name: Resolve parameters
@@ -165,7 +165,6 @@ jobs:
         uses: prefix-dev/setup-pixi@v0.9.6
         with:
           pixi-version: latest
-          cache: true
 
       - name: Download chunk manifests artifact
         uses: actions/download-artifact@v8
@@ -271,7 +270,6 @@ jobs:
         uses: prefix-dev/setup-pixi@v0.9.6
         with:
           pixi-version: latest
-          cache: true
 
       - name: Download all chunk sketches
         uses: actions/download-artifact@v8
