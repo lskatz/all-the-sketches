@@ -1,10 +1,10 @@
 name: Sketch All-the-Bacteria
 
 # ---------------------------------------------------------------------------
-# Testing mode (active): 1 000 genomes, 100 per chunk → 10 parallel jobs
-# Production mode:       all genomes, 500 per chunk
-# Flip the two env vars below (or convert to workflow_dispatch inputs) when
-# you are ready for a full run.
+# Testing mode (active): 1 000 genomes, ≤ 200 parallel jobs
+# Production mode:       all genomes,   ≤ 200 parallel jobs
+# Chunk size is computed automatically as ceil(total / MAX_JOBS) so the
+# matrix never exceeds MAX_JOBS entries (GitHub Actions hard limit: 256).
 # ---------------------------------------------------------------------------
 
 on:
@@ -17,17 +17,11 @@ on:
         required: false
         default: '1000'
         type: string
-      chunk_size:
-        description: >
-          Genomes per chunk (100 for testing, 500 for production).
-        required: false
-        default: '100'
-        type: string
 
-# ── default values used when the input block above is not supplied ──────────
+# ── default values used when the workflow is triggered by a push ────────────
 env:
   DEFAULT_MAX_GENOMES: '1000'   # ← change to '0' for a full run
-  DEFAULT_CHUNK_SIZE:  '100'    # ← change to '500' for production
+  MAX_JOBS: '200'               # chunk size is computed to stay within this
 
 # ---------------------------------------------------------------------------
 # JOB 1 – prepare
@@ -56,9 +50,7 @@ jobs:
         id: params
         run: |
           MAX="${{ github.event.inputs.max_genomes }}"
-          CHUNK="${{ github.event.inputs.chunk_size }}"
-          echo "max_genomes=${MAX:-$DEFAULT_MAX_GENOMES}"   >> "$GITHUB_OUTPUT"
-          echo "chunk_size=${CHUNK:-$DEFAULT_CHUNK_SIZE}"   >> "$GITHUB_OUTPUT"
+          echo "max_genomes=${MAX:-$DEFAULT_MAX_GENOMES}" >> "$GITHUB_OUTPUT"
 
       - name: Download assembly manifest from S3
         run: |
@@ -93,18 +85,24 @@ jobs:
           set -euo pipefail
 
           MAX_GENOMES="${{ steps.params.outputs.max_genomes }}"
-          CHUNK_SIZE="${{ steps.params.outputs.chunk_size }}"
 
-          echo "MAX_GENOMES=${MAX_GENOMES}, CHUNK_SIZE=${CHUNK_SIZE}"
-
-          # Subset (skip subset when MAX_GENOMES=0 → use all)
+          # Subset (skip when MAX_GENOMES=0 → use all)
           if [ "$MAX_GENOMES" -gt 0 ]; then
             head -n "$MAX_GENOMES" data/all_assemblies.txt > data/subset_assemblies.txt
           else
             cp data/all_assemblies.txt data/subset_assemblies.txt
           fi
 
-          echo "Assemblies to process: $(wc -l < data/subset_assemblies.txt)"
+          TOTAL=$(wc -l < data/subset_assemblies.txt)
+          echo "Assemblies to process: $TOTAL"
+
+          # Compute chunk size so we never exceed MAX_JOBS parallel jobs.
+          # Uses ceiling division: chunk_size = ceil(total / max_jobs)
+          CHUNK_SIZE=$(( (TOTAL + MAX_JOBS - 1) / MAX_JOBS ))
+          # Guard: at least 1 genome per chunk (handles TOTAL < MAX_JOBS)
+          CHUNK_SIZE=$(( CHUNK_SIZE < 1 ? 1 : CHUNK_SIZE ))
+          NUM_CHUNKS=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+          echo "Chunk size: $CHUNK_SIZE genome(s) → $NUM_CHUNKS chunk(s) (MAX_JOBS=$MAX_JOBS)"
 
           # Split into fixed-size chunks
           mkdir -p chunks
@@ -261,6 +259,8 @@ jobs:
     name: Combine all chunk sketches
     needs: sketch
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create releases and upload assets
 
     steps:
       - name: Checkout repository
@@ -305,3 +305,18 @@ jobs:
           name: all-the-sketches
           path: all-the-sketches.msh
           retention-days: 90
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Create a new release and attach the sketch.
+          # If the release already exists (e.g. re-run on the same tag),
+          # fall back to uploading/overwriting the asset on the existing release.
+          gh release create "${{ github.ref_name }}" \
+            --title "all-the-sketches ${{ github.ref_name }}" \
+            --notes "Combined Mash sketch of all AllTheBacteria assemblies (tag \`${{ github.ref_name }}\`)." \
+            all-the-sketches.msh \
+          || gh release upload "${{ github.ref_name }}" \
+               all-the-sketches.msh --clobber
