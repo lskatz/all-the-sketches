@@ -1,0 +1,11 @@
+[workspace]
+authors = ["Lee Katz <lskatz@gmail.com>"]
+channels = ["conda-forge", "bioconda"]
+name = "all-the-sketches"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+awscli = ">=2.34.53,<3"
