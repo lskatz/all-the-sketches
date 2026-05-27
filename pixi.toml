@@ -9,3 +9,4 @@ version = "0.1.0"
 
 [dependencies]
 awscli = ">=2.34.53,<3"
+mash = ">=2.3,<3"

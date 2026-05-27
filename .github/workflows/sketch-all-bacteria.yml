@@ -1,0 +1,309 @@
+name: Sketch All-the-Bacteria
+
+# ---------------------------------------------------------------------------
+# Testing mode (active): 1 000 genomes, 100 per chunk → 10 parallel jobs
+# Production mode:       all genomes, 500 per chunk
+# Flip the two env vars below (or convert to workflow_dispatch inputs) when
+# you are ready for a full run.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_genomes:
+        description: >
+          Max genomes to process (0 = all). Use 1000 for testing.
+        required: false
+        default: '1000'
+        type: string
+      chunk_size:
+        description: >
+          Genomes per chunk (100 for testing, 500 for production).
+        required: false
+        default: '100'
+        type: string
+
+# ── default values used when the input block above is not supplied ──────────
+env:
+  DEFAULT_MAX_GENOMES: '1000'   # ← change to '0' for a full run
+  DEFAULT_CHUNK_SIZE:  '100'    # ← change to '500' for production
+
+# ---------------------------------------------------------------------------
+# JOB 1 – prepare
+#   • Download the AllTheBacteria assembly manifest from S3
+#   • Subset (for testing) and split into fixed-size chunk files
+#   • Emit a JSON array of chunk IDs for the matrix job
+# ---------------------------------------------------------------------------
+jobs:
+  prepare:
+    name: Download manifest and create chunks
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.make-chunks.outputs.chunks }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up pixi
+        uses: prefix-dev/setup-pixi@v0.9.6
+        with:
+          pixi-version: latest
+          cache: true
+
+      # Resolve effective settings (prefer workflow_dispatch input > default)
+      - name: Resolve parameters
+        id: params
+        run: |
+          MAX="${{ github.event.inputs.max_genomes }}"
+          CHUNK="${{ github.event.inputs.chunk_size }}"
+          echo "max_genomes=${MAX:-$DEFAULT_MAX_GENOMES}"   >> "$GITHUB_OUTPUT"
+          echo "chunk_size=${CHUNK:-$DEFAULT_CHUNK_SIZE}"   >> "$GITHUB_OUTPUT"
+
+      - name: Download assembly manifest from S3
+        run: |
+          set -euo pipefail
+
+          mkdir -p data
+
+          echo "=== Finding latest manifest file ==="
+          LATEST=$(pixi run aws s3 ls --no-sign-request \
+            s3://allthebacteria-metadata/allthebacteria-assemblies/assemblies-list/data/ \
+            | sort | tail -n1 | awk '{print $4}')
+          echo "Latest manifest: $LATEST"
+
+          echo "=== Downloading manifest ==="
+          pixi run aws s3 cp --no-sign-request \
+            "s3://allthebacteria-metadata/allthebacteria-assemblies/assemblies-list/data/${LATEST}" \
+            data/latest.tsv.gz
+
+          echo "=== Extracting assembly filenames ==="
+          # CSV format: "bucket","filename.fa.gz","size","date","md5",""
+          zcat data/latest.tsv.gz \
+            | cut -d',' -f2 \
+            | tr -d '"' \
+            > data/all_assemblies.txt
+
+          TOTAL=$(wc -l < data/all_assemblies.txt)
+          echo "Total assemblies in manifest: $TOTAL"
+
+      - name: Subset and split into chunks
+        id: make-chunks
+        run: |
+          set -euo pipefail
+
+          MAX_GENOMES="${{ steps.params.outputs.max_genomes }}"
+          CHUNK_SIZE="${{ steps.params.outputs.chunk_size }}"
+
+          echo "MAX_GENOMES=${MAX_GENOMES}, CHUNK_SIZE=${CHUNK_SIZE}"
+
+          # Subset (skip subset when MAX_GENOMES=0 → use all)
+          if [ "$MAX_GENOMES" -gt 0 ]; then
+            head -n "$MAX_GENOMES" data/all_assemblies.txt > data/subset_assemblies.txt
+          else
+            cp data/all_assemblies.txt data/subset_assemblies.txt
+          fi
+
+          echo "Assemblies to process: $(wc -l < data/subset_assemblies.txt)"
+
+          # Split into fixed-size chunks
+          mkdir -p chunks
+          split \
+            --lines="$CHUNK_SIZE" \
+            --numeric-suffixes \
+            --suffix-length=4 \
+            data/subset_assemblies.txt \
+            chunks/chunk_
+
+          # Rename to add .txt extension so the artifact is tidy
+          for f in chunks/chunk_????; do
+            mv "$f" "${f}.txt"
+          done
+
+          echo "=== Chunk files created ==="
+          ls -lh chunks/
+
+          # Build JSON array of chunk IDs, e.g. ["0000","0001",...]
+          CHUNKS=$(ls chunks/chunk_*.txt \
+            | sed 's|chunks/chunk_||' \
+            | sed 's|\.txt||' \
+            | jq -R . \
+            | jq -sc .)
+          echo "chunks=${CHUNKS}" >> "$GITHUB_OUTPUT"
+          echo "Matrix: ${CHUNKS}"
+
+      - name: Upload chunk manifests
+        uses: actions/upload-artifact@v7
+        with:
+          name: chunk-manifests
+          path: chunks/
+          retention-days: 1   # ephemeral; only needed during this workflow run
+
+# ---------------------------------------------------------------------------
+# JOB 2 – sketch  (fan-out matrix over every chunk)
+#   • Download the chunk manifest
+#   • For each genome:  download → mash sketch → delete assembly
+#   • Paste per-genome sketches into one chunk sketch
+#   • Upload the chunk sketch as an artifact
+# ---------------------------------------------------------------------------
+  sketch:
+    name: Sketch chunk ${{ matrix.chunk }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chunk: ${{ fromJSON(needs.prepare.outputs.chunks) }}
+      fail-fast: false   # let other chunks continue even if one fails
+    env:
+      CHUNK: ${{ matrix.chunk }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up pixi
+        uses: prefix-dev/setup-pixi@v0.9.6
+        with:
+          pixi-version: latest
+          cache: true
+
+      - name: Download chunk manifests artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: chunk-manifests
+          path: chunks/
+
+      - name: Disk space (before)
+        run: df -h
+
+      - name: Download, sketch, and delete assemblies
+        run: |
+          set -euo pipefail
+
+          CHUNK_FILE="chunks/chunk_${CHUNK}.txt"
+          echo "=== Processing chunk: ${CHUNK} ==="
+          echo "Genomes in this chunk:"
+          cat "$CHUNK_FILE"
+          echo ""
+
+          mkdir -p assemblies sketches
+          FAILED=0
+
+          while IFS= read -r genome; do
+            # Skip blank lines
+            [[ -z "$genome" ]] && continue
+
+            ACCESSION="${genome%.fa.gz}"
+            S3_URI="s3://allthebacteria-assemblies/${genome}"
+
+            echo "--- ${ACCESSION} ---"
+
+            # 1. Download assembly
+            if ! pixi run aws s3 cp --no-sign-request \
+                   "$S3_URI" "assemblies/${genome}"; then
+              echo "WARNING: download failed for ${genome} — skipping"
+              (( FAILED++ )) || true
+              continue
+            fi
+
+            # 2. Sketch  (-k 21 -s 1000 are Mash defaults; adjust as needed)
+            if ! pixi run mash sketch \
+                   -k 21 -s 1000 \
+                   -o "sketches/${ACCESSION}" \
+                   "assemblies/${genome}"; then
+              echo "WARNING: sketch failed for ${genome} — skipping"
+              rm -f "assemblies/${genome}"
+              (( FAILED++ )) || true
+              continue
+            fi
+
+            # 3. Delete the assembly immediately to reclaim disk space
+            rm "assemblies/${genome}"
+            echo "OK: ${ACCESSION}.msh"
+          done < "$CHUNK_FILE"
+
+          echo ""
+          echo "=== Chunk ${CHUNK} complete: ${FAILED} failure(s) ==="
+          ls -lh sketches/
+
+      - name: Disk space (after sketching)
+        run: df -h
+
+      - name: Paste per-genome sketches into one chunk sketch
+        run: |
+          set -euo pipefail
+
+          SKETCH_COUNT=$(ls sketches/*.msh 2>/dev/null | wc -l)
+          if [ "$SKETCH_COUNT" -eq 0 ]; then
+            echo "ERROR: no sketches produced for chunk ${CHUNK}"
+            exit 1
+          fi
+          echo "Pasting ${SKETCH_COUNT} sketches for chunk ${CHUNK}"
+
+          pixi run mash paste "chunk_${CHUNK}.msh" sketches/*.msh
+
+          echo "=== Chunk sketch info ==="
+          pixi run mash info "chunk_${CHUNK}.msh"
+
+      - name: Upload chunk sketch
+        uses: actions/upload-artifact@v7
+        with:
+          name: sketch-chunk-${{ matrix.chunk }}
+          path: chunk_${{ matrix.chunk }}.msh
+          retention-days: 7
+
+# ---------------------------------------------------------------------------
+# JOB 3 – combine
+#   • Download every chunk sketch artifact
+#   • Run mash paste to produce a single combined sketch
+#   • Upload the final sketch
+# ---------------------------------------------------------------------------
+  combine:
+    name: Combine all chunk sketches
+    needs: sketch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up pixi
+        uses: prefix-dev/setup-pixi@v0.9.6
+        with:
+          pixi-version: latest
+          cache: true
+
+      - name: Download all chunk sketches
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sketch-chunk-*
+          path: chunk-sketches/
+          merge-multiple: true   # flatten all artifacts into one directory
+
+      - name: List chunk sketches
+        run: |
+          echo "=== Chunk sketches available ==="
+          ls -lh chunk-sketches/
+          echo "Total: $(ls chunk-sketches/*.msh | wc -l) sketch files"
+
+      - name: Disk space (before paste)
+        run: df -h
+
+      - name: Combine into final sketch
+        run: |
+          set -euo pipefail
+
+          pixi run mash paste all-the-sketches.msh chunk-sketches/*.msh
+
+          echo "=== Final sketch info ==="
+          pixi run mash info all-the-sketches.msh
+
+      - name: Disk space (after paste)
+        run: df -h
+
+      - name: Upload final combined sketch
+        uses: actions/upload-artifact@v7
+        with:
+          name: all-the-sketches
+          path: all-the-sketches.msh
+          retention-days: 90
