@@ -30,11 +30,16 @@ def read_genomes(path: Path) -> list[str]:
 
 
 def assign_prefixes(genomes: list[str], num_chunks: int, prefix_len: int) -> tuple[list[Chunk], float]:
+    if num_chunks <= 0:
+        raise ValueError("num_chunks must be greater than zero")
+
     by_prefix: dict[str, list[str]] = defaultdict(list)
     for genome in genomes:
         by_prefix[genome[:prefix_len]].append(genome)
 
     chunks = [Chunk(idx=i) for i in range(num_chunks)]
+    if not chunks:
+        raise ValueError("No chunks were created")
     bucket_items = sorted(by_prefix.items(), key=lambda kv: len(kv[1]), reverse=True)
     for prefix, items in bucket_items:
         target = min(chunks, key=lambda chunk: (chunk.count, chunk.idx))

@@ -130,12 +130,13 @@ jobs:
           else
             CHUNK_SIZE=$(( (TOTAL + MAX_JOBS - 1) / MAX_JOBS ))
           fi
+          CHUNK_SIZE=$(( CHUNK_SIZE < 1 ? 1 : CHUNK_SIZE ))
           NUM_CHUNKS=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
           if [ "$NUM_CHUNKS" -gt "$MAX_JOBS" ]; then
             CHUNK_SIZE=$(( (TOTAL + MAX_JOBS - 1) / MAX_JOBS ))
+            CHUNK_SIZE=$(( CHUNK_SIZE < 1 ? 1 : CHUNK_SIZE ))
             NUM_CHUNKS=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
           fi
-          CHUNK_SIZE=$(( CHUNK_SIZE < 1 ? 1 : CHUNK_SIZE ))
           echo "Target chunk size: $CHUNK_SIZE genome(s) → $NUM_CHUNKS chunk(s) (MAX_JOBS=${MAX_JOBS})"
 
           # Build balanced wildcard chunks for aws --include.
@@ -251,7 +252,9 @@ jobs:
 
           for attempt in $(seq 1 "${DOWNLOAD_RETRIES}"); do
             echo "Wildcard download attempt ${attempt}/${DOWNLOAD_RETRIES}"
-            aws "${AWS_ARGS[@]}" >/dev/null || true
+            if ! aws "${AWS_ARGS[@]}" >/dev/null; then
+              echo "WARNING: wildcard download command failed on attempt ${attempt}" >&2
+            fi
             write_missing
             MISSING_COUNT=$(wc -l < "${MISSING_FILE}")
             if [ "${MISSING_COUNT}" -eq 0 ]; then
@@ -265,7 +268,7 @@ jobs:
           MISSING_COUNT=$(wc -l < "${MISSING_FILE}")
           if [ "${MISSING_COUNT}" -gt 0 ]; then
             echo "Running per-genome fallback for ${MISSING_COUNT} genome(s)"
-            xargs -P "${WORKERS}" -I{} bash -c '
+            if ! xargs -P "${WORKERS}" -I{} bash -c '
               genome="$1"
               s3_uri="s3://allthebacteria-assemblies/${genome}"
               for attempt in $(seq 1 '"${DOWNLOAD_RETRIES}"'); do
@@ -277,7 +280,9 @@ jobs:
               done
               echo "ERROR: failed to download ${genome}" >&2
               exit 1
-            ' -- {} < "${MISSING_FILE}" || true
+            ' -- {} < "${MISSING_FILE}"; then
+              echo "WARNING: one or more fallback downloads failed" >&2
+            fi
           fi
 
           write_missing
