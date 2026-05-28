@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,26 +60,64 @@ def verify_coverage(genomes: list[str], chunks: list[Chunk]) -> None:
         raise ValueError("Chunk assignment missed one or more genomes")
 
 
-def choose_layout(genomes: list[str], num_chunks: int, max_imbalance_pct: float) -> tuple[list[Chunk], int, float]:
+def choose_layout(
+    genomes: list[str],
+    num_chunks: int,
+    max_imbalance_pct: float,
+    min_genomes_per_prefix: int = 2,
+) -> tuple[list[Chunk], int, float]:
     max_len = max(len(g) for g in genomes)
     best: tuple[list[Chunk], int, float] | None = None
+    # Best layout where every prefix bucket contains >= min_genomes_per_prefix genomes.
+    best_min_ok: tuple[list[Chunk], int, float] | None = None
 
     for prefix_len in range(1, max_len + 1):
-        bucket_count = len(Counter(g[:prefix_len] for g in genomes))
-        if bucket_count < num_chunks:
+        prefix_counts = Counter(g[:prefix_len] for g in genomes)
+        if len(prefix_counts) < num_chunks:
             continue
 
         chunks, max_dev = assign_prefixes(genomes, num_chunks, prefix_len)
         verify_coverage(genomes, chunks)
+
+        all_buckets_ok = all(c >= min_genomes_per_prefix for c in prefix_counts.values())
+
+        if all_buckets_ok and (best_min_ok is None or max_dev < best_min_ok[2]):
+            best_min_ok = (chunks, prefix_len, max_dev)
+
         if best is None or max_dev < best[2]:
             best = (chunks, prefix_len, max_dev)
-        if max_dev <= max_imbalance_pct:
+
+        if all_buckets_ok and max_dev <= max_imbalance_pct:
             return chunks, prefix_len, max_dev
 
+    # Prefer a layout where every wildcard matches >= min_genomes_per_prefix genomes,
+    # even if the target balance cannot be met simultaneously.
+    if best_min_ok is not None:
+        chunks, prefix_len, max_dev = best_min_ok
+        if max_dev > max_imbalance_pct:
+            print(
+                f"WARNING: Could not achieve ≤{max_imbalance_pct:.2f}% imbalance while ensuring "
+                f"every wildcard matches ≥{min_genomes_per_prefix} genomes. "
+                f"Best multi-genome balance: {max_dev:.2f}%.",
+                file=sys.stderr,
+            )
+        return chunks, prefix_len, max_dev
+
+    # No prefix length satisfies the min_genomes_per_prefix constraint.
+    # Fall back to the best balanced layout with a warning about singular wildcards.
     if best is None:
         raise ValueError("Could not generate wildcard buckets for requested chunk count")
+    chunks, prefix_len, max_dev = best
+    if max_dev <= max_imbalance_pct:
+        print(
+            f"WARNING: Every wildcard-prefix layout has at least one prefix matching "
+            f"<{min_genomes_per_prefix} genome(s). Proceeding with best balanced layout "
+            f"({max_dev:.2f}% imbalance).",
+            file=sys.stderr,
+        )
+        return chunks, prefix_len, max_dev
     raise ValueError(
-        f"Best wildcard balance was {best[2]:.2f}% (target <= {max_imbalance_pct:.2f}%). "
+        f"Best wildcard balance was {max_dev:.2f}% (target <= {max_imbalance_pct:.2f}%). "
         f"Try fewer chunks or a larger subset."
     )
 
@@ -104,16 +143,25 @@ def main() -> int:
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--num-chunks", required=True, type=int)
     parser.add_argument("--max-imbalance-pct", type=float, default=10.0)
+    parser.add_argument(
+        "--min-genomes-per-prefix",
+        type=int,
+        default=2,
+        help="Minimum number of genomes each --include wildcard must match (default: 2).",
+    )
     parser.add_argument("--summary-json", required=True, type=Path)
     args = parser.parse_args()
 
     genomes = read_genomes(args.input)
     num_chunks = max(1, min(args.num_chunks, len(genomes)))
-    chunks, prefix_len, max_dev = choose_layout(genomes, num_chunks, args.max_imbalance_pct)
+    chunks, prefix_len, max_dev = choose_layout(
+        genomes, num_chunks, args.max_imbalance_pct, args.min_genomes_per_prefix
+    )
     chunk_ids = write_outputs(chunks, args.out_dir)
 
     summary = {
         "chunk_ids": chunk_ids,
+        "min_genomes_per_prefix": args.min_genomes_per_prefix,
         "prefix_len": prefix_len,
         "max_imbalance_pct": round(max_dev, 4),
         "total_genomes": len(genomes),
@@ -127,6 +175,7 @@ def main() -> int:
     lower = math.floor(expected * (1 - (args.max_imbalance_pct / 100.0)))
     print(f"Wildcard type: aws --include uses shell-style globs (*, ?, [seq], [!seq])")
     print(f"Prefix length used: {prefix_len}")
+    print(f"Min genomes per prefix: {args.min_genomes_per_prefix}")
     print(f"Expected genomes/chunk: {expected:.2f} (allowed integer range: {lower}..{upper})")
     print(f"Observed max imbalance: {max_dev:.2f}%")
     for chunk in chunks:
