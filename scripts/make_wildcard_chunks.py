@@ -38,8 +38,6 @@ def assign_prefixes(genomes: list[str], num_chunks: int, prefix_len: int) -> tup
         by_prefix[genome[:prefix_len]].append(genome)
 
     chunks = [Chunk(idx=i) for i in range(num_chunks)]
-    if not chunks:
-        raise ValueError("No chunks were created")
     bucket_items = sorted(by_prefix.items(), key=lambda kv: len(kv[1]), reverse=True)
     for prefix, items in bucket_items:
         target = min(chunks, key=lambda chunk: (chunk.count, chunk.idx))

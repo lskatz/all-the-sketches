@@ -268,7 +268,7 @@ jobs:
           MISSING_COUNT=$(wc -l < "${MISSING_FILE}")
           if [ "${MISSING_COUNT}" -gt 0 ]; then
             echo "Running per-genome fallback for ${MISSING_COUNT} genome(s)"
-            if ! xargs -P "${WORKERS}" -I{} bash -c '
+            xargs -P "${WORKERS}" -I{} bash -c '
               genome="$1"
               s3_uri="s3://allthebacteria-assemblies/${genome}"
               for attempt in $(seq 1 '"${DOWNLOAD_RETRIES}"'); do
@@ -276,13 +276,11 @@ jobs:
                      "$s3_uri" "assemblies/${genome}" >/dev/null; then
                   exit 0
                 fi
+                echo "Fallback retry ${attempt}/'"${DOWNLOAD_RETRIES}"' for ${genome}" >&2
                 sleep $(( attempt * 5 ))
               done
               echo "ERROR: failed to download ${genome}" >&2
-              exit 1
-            ' -- {} < "${MISSING_FILE}"; then
-              echo "WARNING: one or more fallback downloads failed" >&2
-            fi
+            ' -- {} < "${MISSING_FILE}" || true
           fi
 
           write_missing
