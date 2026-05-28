@@ -12,8 +12,8 @@ name: Sketch All-the-Bacteria
 #
 #   Batch download → sketch (within each chunk job)
 #     Genomes in a chunk are processed in batches of up to BATCH_SIZE (1000).
-#     All genomes in a batch are downloaded in parallel (WORKERS_CAP threads),
-#     then passed to a single mash sketch call, then deleted.
+#     All genomes in a batch are downloaded concurrently via xargs -P (WORKERS_CAP
+#     workers), then passed to a single mash sketch call, then deleted.
 #     The final batch handles any remainder genomes automatically.
 #
 #   S3 retry
@@ -45,7 +45,7 @@ env:
   MAX_JOBS: '200'                    # hard cap on matrix entries (Actions limit: 256)
   DEFAULT_TARGET_CHUNK_SIZE: '0'     # 0 = spread evenly across MAX_JOBS (200) jobs
   DOWNLOAD_RETRIES: '3'              # S3 retry attempts per genome
-  WORKERS_CAP: '4'                   # max parallel download workers per runner
+  WORKERS_CAP: '4'                   # max concurrent xargs download workers per runner
 
 # ---------------------------------------------------------------------------
 # JOB 1 – prepare
@@ -175,7 +175,7 @@ jobs:
 
 # ---------------------------------------------------------------------------
 # JOB 2 – sketch  (fan-out matrix over every chunk)
-#   • WORKERS genomes processed in parallel (GNU parallel)
+#   • WORKERS genomes downloaded concurrently (xargs -P)
 #   • Each worker: download (with retry) → mash sketch → delete assembly
 #   • Paste per-genome sketches into one chunk .msh file
 # ---------------------------------------------------------------------------
@@ -239,28 +239,6 @@ jobs:
             "${GENOMES_TMP}" "${BATCHES_DIR}/batch_" \
             || { echo "ERROR: Failed to split genomes into batches"; exit 1; }
 
-          # Per-genome download with retry (called inside parallel subshells)
-          download_one() {
-            local genome="$1"
-            local s3_uri="s3://allthebacteria-assemblies/${genome}"
-            local attempt
-            for attempt in $(seq 1 "${DOWNLOAD_RETRIES}"); do
-              if aws s3 cp --no-sign-request --no-progress \
-                   "$s3_uri" "assemblies/${genome}" >/dev/null; then
-                return 0
-              fi
-              if [ "$attempt" -ge "${DOWNLOAD_RETRIES}" ]; then
-                echo "SKIP ${genome}: download failed after ${DOWNLOAD_RETRIES} attempts" >&2
-              else
-                echo "Retry ${attempt}/${DOWNLOAD_RETRIES} for ${genome}" >&2
-                sleep $(( attempt * 5 ))
-              fi
-            done
-            return 0
-          }
-          export -f download_one
-          export DOWNLOAD_RETRIES
-
           BATCH_NUM=0
           DOWNLOADED_TOTAL=0
           SKETCH_FAILURES=0
@@ -269,8 +247,24 @@ jobs:
             BATCH_COUNT=$(wc -l < "${batch_file}")
             echo "=== Batch ${BATCH_NUM}: downloading ${BATCH_COUNT} genome(s) ==="
 
-            # Download all genomes in this batch in parallel
-            parallel --jobs "${WORKERS}" download_one :::: "${batch_file}" \
+            # Download all genomes in this batch in parallel using xargs -P
+            # Each genome is retried up to DOWNLOAD_RETRIES times with linear backoff.
+            xargs -P "${WORKERS}" -I{} bash -c '
+              genome="$1"
+              s3_uri="s3://allthebacteria-assemblies/${genome}"
+              for attempt in $(seq 1 '"${DOWNLOAD_RETRIES}"'); do
+                if aws s3 cp --no-sign-request --no-progress \
+                     "$s3_uri" "assemblies/${genome}" >/dev/null; then
+                  exit 0
+                fi
+                if [ "$attempt" -ge '"${DOWNLOAD_RETRIES}"' ]; then
+                  echo "SKIP ${genome}: download failed after '"${DOWNLOAD_RETRIES}"' attempts" >&2
+                else
+                  echo "Retry ${attempt}/'"${DOWNLOAD_RETRIES}"' for ${genome}" >&2
+                  sleep $(( attempt * 5 ))
+                fi
+              done
+            ' -- {} < "${batch_file}" \
               || echo "WARNING: Some downloads failed in batch ${BATCH_NUM}"
 
             # Collect successfully downloaded assemblies
