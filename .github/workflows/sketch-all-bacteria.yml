@@ -6,19 +6,18 @@ name: Sketch All-the-Bacteria
 #
 # Design:
 #   Chunking
-#     Genomes are divided evenly across MAX_JOBS (200) matrix jobs.
-#     Chunk size = ceil(total / MAX_JOBS).  A custom TARGET_CHUNK_SIZE > 0
-#     overrides this (capped so chunks never exceed the 256-job Actions limit).
+#     Genomes are assigned to chunks using aws --include wildcard globs.
+#     Prefix buckets are greedily balanced and must stay within ±10%.
+#     Chunk count is derived from TARGET_CHUNK_SIZE (or MAX_JOBS).
 #
-#   Batch download → sketch (within each chunk job)
-#     Genomes in a chunk are processed in batches of up to BATCH_SIZE (1000).
-#     All genomes in a batch are downloaded concurrently via xargs -P (WORKERS_CAP
-#     workers), then passed to a single mash sketch call, then deleted.
-#     The final batch handles any remainder genomes automatically.
+#   Download → sketch (within each chunk job)
+#     Each chunk first downloads with aws s3 cp --recursive --exclude '*' plus
+#     chunk-specific --include globs, verifies all genomes are present, then
+#     falls back to per-genome retries for any misses.
 #
 #   S3 retry
-#     Each download is retried up to DOWNLOAD_RETRIES times (default 3) with
-#     linear backoff before the genome is skipped.
+#     Wildcard downloads and fallback downloads are retried up to
+#     DOWNLOAD_RETRIES (default 3) with linear backoff.
 # ---------------------------------------------------------------------------
 
 on:
@@ -45,12 +44,12 @@ env:
   MAX_JOBS: '200'                    # hard cap on matrix entries (Actions limit: 256)
   DEFAULT_TARGET_CHUNK_SIZE: '0'     # 0 = spread evenly across MAX_JOBS (200) jobs
   DOWNLOAD_RETRIES: '3'              # S3 retry attempts per genome
-  WORKERS_CAP: '4'                   # max concurrent xargs download workers per runner
+  WORKERS_CAP: '4'                   # max concurrent fallback download workers per runner
 
 # ---------------------------------------------------------------------------
 # JOB 1 – prepare
 #   • Download the AllTheBacteria assembly manifest from S3
-#   • Subset (for testing) and split into timeout-safe chunk files
+#   • Subset (for testing) and build wildcard chunk manifests
 #   • Emit a JSON array of chunk IDs
 # ---------------------------------------------------------------------------
 jobs:
@@ -104,7 +103,7 @@ jobs:
           TOTAL=$(wc -l < data/all_assemblies.txt)
           echo "Total assemblies in manifest: $TOTAL"
 
-      - name: Subset and split into chunks
+      - name: Subset and build wildcard chunks
         id: make-chunks
         run: |
           set -euo pipefail
@@ -122,11 +121,10 @@ jobs:
           TOTAL=$(wc -l < data/subset_assemblies.txt)
           echo "Assemblies to process: $TOTAL"
 
-          # Chunk sizing (timeout-safe):
-          #   1. Use TARGET_CHUNK_SIZE if > 0 to bound per-job runtime.
-          #   2. If that creates > MAX_JOBS chunks, scale up chunk size to
-          #      stay within the Actions matrix limit.
-          #   3. Guard: at least 1 genome per chunk.
+          # Chunk sizing:
+          #   1. Use TARGET_CHUNK_SIZE if > 0.
+          #   2. Otherwise, spread genomes evenly across MAX_JOBS.
+          #   3. Enforce MAX_JOBS cap.
           if [ "$TARGET_CHUNK_SIZE" -gt 0 ]; then
             CHUNK_SIZE="$TARGET_CHUNK_SIZE"
           else
@@ -138,31 +136,22 @@ jobs:
             NUM_CHUNKS=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
           fi
           CHUNK_SIZE=$(( CHUNK_SIZE < 1 ? 1 : CHUNK_SIZE ))
-          echo "Chunk size: $CHUNK_SIZE genome(s) → $NUM_CHUNKS chunk(s) (MAX_JOBS=${MAX_JOBS})"
+          echo "Target chunk size: $CHUNK_SIZE genome(s) → $NUM_CHUNKS chunk(s) (MAX_JOBS=${MAX_JOBS})"
 
-          # Split into fixed-size chunks
+          # Build balanced wildcard chunks for aws --include.
           mkdir -p chunks
-          split \
-            --lines="$CHUNK_SIZE" \
-            --numeric-suffixes \
-            --suffix-length=4 \
-            data/subset_assemblies.txt \
-            chunks/chunk_
-
-          # Rename to add .txt extension so the artifact is tidy
-          for f in chunks/chunk_????; do
-            mv "$f" "${f}.txt"
-          done
+          python3 scripts/make_wildcard_chunks.py \
+            --input data/subset_assemblies.txt \
+            --out-dir chunks \
+            --num-chunks "$NUM_CHUNKS" \
+            --max-imbalance-pct 10 \
+            --summary-json chunks/chunk_summary.json
 
           echo "=== Chunk files created ==="
           ls -lh chunks/
 
           # Build JSON array of chunk IDs, e.g. ["0000","0001",...]
-          CHUNKS=$(ls chunks/chunk_*.txt \
-            | sed 's|chunks/chunk_||' \
-            | sed 's|\.txt||' \
-            | jq -R . \
-            | jq -sc .)
+          CHUNKS=$(jq -c '.chunk_ids' chunks/chunk_summary.json)
           echo "chunks=${CHUNKS}" >> "$GITHUB_OUTPUT"
           echo "Matrix: ${CHUNKS}"
 
@@ -175,9 +164,8 @@ jobs:
 
 # ---------------------------------------------------------------------------
 # JOB 2 – sketch  (fan-out matrix over every chunk)
-#   • WORKERS genomes downloaded concurrently (xargs -P)
-#   • Each worker: download (with retry) → mash sketch → delete assembly
-#   • Paste per-genome sketches into one chunk .msh file
+#   • Download chunk assemblies with aws --include wildcard patterns
+#   • Verify chunk coverage, fallback-download any misses, sketch chunk
 # ---------------------------------------------------------------------------
   sketch:
     name: Sketch chunk ${{ matrix.chunk }}
@@ -211,7 +199,7 @@ jobs:
           set -euo pipefail
 
           CHUNK_FILE="chunks/chunk_${CHUNK}.txt"
-          BATCH_SIZE=1000
+          INCLUDE_FILE="chunks/chunk_${CHUNK}.includes.txt"
 
           # Worker count for parallel downloads: available CPUs, capped at WORKERS_CAP
           AVAIL=$(nproc 2>/dev/null || echo 2)
@@ -222,33 +210,61 @@ jobs:
           MASH_BIN=$(pixi run which mash)
           export MASH_BIN
 
-          mkdir -p assemblies sketches
+          mkdir -p assemblies
 
-          # Strip blank lines
-          GENOMES_TMP=$(mktemp)
-          BATCHES_DIR=$(mktemp -d)
-          trap 'rm -rf "${BATCHES_DIR}" "${GENOMES_TMP}"' EXIT
-          grep -v '^[[:space:]]*$' "${CHUNK_FILE}" > "${GENOMES_TMP}"
+          if [ ! -f "${CHUNK_FILE}" ] || [ ! -f "${INCLUDE_FILE}" ]; then
+            echo "ERROR: missing chunk manifest(s) for chunk ${CHUNK}"
+            exit 1
+          fi
 
-          TOTAL=$(wc -l < "${GENOMES_TMP}")
+          TOTAL=$(grep -vc '^[[:space:]]*$' "${CHUNK_FILE}")
           echo "Chunk ${CHUNK}: ${TOTAL} genomes"
 
-          # Split into batches of up to BATCH_SIZE genomes;
-          # the final batch naturally contains any remainder.
-          split --lines="${BATCH_SIZE}" --numeric-suffixes=1 --suffix-length=4 \
-            "${GENOMES_TMP}" "${BATCHES_DIR}/batch_" \
-            || { echo "ERROR: Failed to split genomes into batches"; exit 1; }
+          mapfile -t INCLUDE_PATTERNS < <(grep -v '^[[:space:]]*$' "${INCLUDE_FILE}")
+          if [ "${#INCLUDE_PATTERNS[@]}" -eq 0 ]; then
+            echo "ERROR: no include patterns found in ${INCLUDE_FILE}"
+            exit 1
+          fi
 
-          BATCH_NUM=0
-          DOWNLOADED_TOTAL=0
-          SKETCH_FAILURES=0
-          for batch_file in "${BATCHES_DIR}"/batch_*; do
-            BATCH_NUM=$(( BATCH_NUM + 1 ))
-            BATCH_COUNT=$(wc -l < "${batch_file}")
-            echo "=== Batch ${BATCH_NUM}: downloading ${BATCH_COUNT} genome(s) ==="
+          AWS_ARGS=(
+            s3 cp
+            --recursive
+            --no-sign-request
+            --no-progress
+            s3://allthebacteria-assemblies/
+            assemblies/
+            --exclude "*"
+          )
+          for pattern in "${INCLUDE_PATTERNS[@]}"; do
+            AWS_ARGS+=(--include "${pattern}")
+          done
 
-            # Download all genomes in this batch in parallel using xargs -P
-            # Each genome is retried up to DOWNLOAD_RETRIES times with linear backoff.
+          MISSING_FILE=$(mktemp)
+          trap 'rm -f "${MISSING_FILE}"' EXIT
+          write_missing() {
+            : > "${MISSING_FILE}"
+            while IFS= read -r genome; do
+              [ -z "${genome}" ] && continue
+              [ -f "assemblies/${genome}" ] || echo "${genome}" >> "${MISSING_FILE}"
+            done < "${CHUNK_FILE}"
+          }
+
+          for attempt in $(seq 1 "${DOWNLOAD_RETRIES}"); do
+            echo "Wildcard download attempt ${attempt}/${DOWNLOAD_RETRIES}"
+            aws "${AWS_ARGS[@]}" >/dev/null || true
+            write_missing
+            MISSING_COUNT=$(wc -l < "${MISSING_FILE}")
+            if [ "${MISSING_COUNT}" -eq 0 ]; then
+              break
+            fi
+            echo "Missing ${MISSING_COUNT} genome(s) after wildcard attempt ${attempt}" >&2
+            sleep $(( attempt * 5 ))
+          done
+
+          write_missing
+          MISSING_COUNT=$(wc -l < "${MISSING_FILE}")
+          if [ "${MISSING_COUNT}" -gt 0 ]; then
+            echo "Running per-genome fallback for ${MISSING_COUNT} genome(s)"
             xargs -P "${WORKERS}" -I{} bash -c '
               genome="$1"
               s3_uri="s3://allthebacteria-assemblies/${genome}"
@@ -257,68 +273,33 @@ jobs:
                      "$s3_uri" "assemblies/${genome}" >/dev/null; then
                   exit 0
                 fi
-                if [ "$attempt" -ge '"${DOWNLOAD_RETRIES}"' ]; then
-                  echo "SKIP ${genome}: download failed after '"${DOWNLOAD_RETRIES}"' attempts" >&2
-                else
-                  echo "Retry ${attempt}/'"${DOWNLOAD_RETRIES}"' for ${genome}" >&2
-                  sleep $(( attempt * 5 ))
-                fi
+                sleep $(( attempt * 5 ))
               done
-            ' -- {} < "${batch_file}" \
-              || echo "WARNING: Some downloads failed in batch ${BATCH_NUM}"
+              echo "ERROR: failed to download ${genome}" >&2
+              exit 1
+            ' -- {} < "${MISSING_FILE}" || true
+          fi
 
-            # Collect successfully downloaded assemblies
-            GENOME_PATHS=()
-            while IFS= read -r genome; do
-              [ -f "assemblies/${genome}" ] && GENOME_PATHS+=("assemblies/${genome}")
-            done < "${batch_file}"
-
-            BATCH_DOWNLOADED=${#GENOME_PATHS[@]}
-            DOWNLOADED_TOTAL=$(( DOWNLOADED_TOTAL + BATCH_DOWNLOADED ))
-            REMAINING=$(( TOTAL - DOWNLOADED_TOTAL ))
-            echo "Downloaded ${BATCH_DOWNLOADED} of ${BATCH_COUNT} in batch ${BATCH_NUM}" \
-                 "(${DOWNLOADED_TOTAL}/${TOTAL} total, ${REMAINING} remaining)"
-
-            if [ "${#GENOME_PATHS[@]}" -eq 0 ]; then
-              echo "No assemblies downloaded for batch ${BATCH_NUM}, skipping"
-              continue
-            fi
-
-            # Sketch all assemblies in this batch with a single mash call
-            BATCH_SKETCH="sketches/batch_$(printf '%04d' "${BATCH_NUM}")"
-            echo "Sketching ${#GENOME_PATHS[@]} assemblies → ${BATCH_SKETCH}.msh"
-            if ! "$MASH_BIN" sketch -k 21 -s 1000 -o "${BATCH_SKETCH}" \
-                   "${GENOME_PATHS[@]}" 2>&1; then
-              echo "ERROR: mash sketch failed for batch ${BATCH_NUM}"
-              SKETCH_FAILURES=$(( SKETCH_FAILURES + 1 ))
-            fi
-
-            # Delete downloaded assemblies to free disk
-            rm -f "${GENOME_PATHS[@]}"
-          done
-
-          if [ "${SKETCH_FAILURES}" -gt 0 ]; then
-            echo "ERROR: ${SKETCH_FAILURES} batch(es) failed to sketch"
+          write_missing
+          MISSING_COUNT=$(wc -l < "${MISSING_FILE}")
+          if [ "${MISSING_COUNT}" -gt 0 ]; then
+            echo "ERROR: ${MISSING_COUNT} genome(s) still missing after fallback" >&2
+            head -n 20 "${MISSING_FILE}" >&2
             exit 1
           fi
 
-          PRODUCED=$(ls sketches/*.msh 2>/dev/null | wc -l)
-          echo "=== Chunk ${CHUNK}: ${PRODUCED} batch sketch(es) produced ==="
-          ls -lh sketches/
-
-      # ── Paste batch sketches into one chunk sketch ───────────────────────
-      - name: Paste batch sketches into chunk sketch
-        run: |
-          set -euo pipefail
-
-          SKETCH_COUNT=$(ls sketches/*.msh 2>/dev/null | wc -l)
-          if [ "$SKETCH_COUNT" -eq 0 ]; then
-            echo "ERROR: no sketches produced for chunk ${CHUNK}"
+          GENOME_PATHS=()
+          while IFS= read -r genome; do
+            [ -f "assemblies/${genome}" ] && GENOME_PATHS+=("assemblies/${genome}")
+          done < "${CHUNK_FILE}"
+          if [ "${#GENOME_PATHS[@]}" -eq 0 ]; then
+            echo "ERROR: no assemblies downloaded for chunk ${CHUNK}"
             exit 1
           fi
-          echo "Pasting ${SKETCH_COUNT} batch sketch(es) for chunk ${CHUNK}"
 
-          pixi run mash paste "chunk_${CHUNK}.msh" sketches/*.msh
+          echo "Sketching ${#GENOME_PATHS[@]} assemblies for chunk ${CHUNK}"
+          "$MASH_BIN" sketch -k 21 -s 1000 -o "chunk_${CHUNK}" "${GENOME_PATHS[@]}"
+          rm -f "${GENOME_PATHS[@]}"
           echo "=== Chunk sketch info ==="
           pixi run mash info "chunk_${CHUNK}.msh"
 
